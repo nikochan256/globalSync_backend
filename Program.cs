@@ -2,8 +2,10 @@
 //  Valentine Build — Wi-Fi Direct Clipboard Server
 //  .NET 8 / ASP.NET Core Minimal API
 //  + Auto-sync to Windows clipboard via System.Windows.Forms
+//  + Bidirectional sync: laptop copies are pushed to phone
 // ============================================================
 
+using System.Text;
 using System.Text.Json;
 using System.Windows.Forms;   // built-in on Windows — no NuGet needed
 
@@ -59,7 +61,7 @@ app.Use(async (context, next) =>
 
 // ── Endpoints ────────────────────────────────────────────────
 
-// POST /clipboard — receive text from another device
+// POST /clipboard — receive text from phone
 app.MapPost("/clipboard", async (HttpContext context) =>
 {
     var body = await JsonSerializer.DeserializeAsync<ClipboardPayload>(
@@ -73,14 +75,18 @@ app.MapPost("/clipboard", async (HttpContext context) =>
         return;
     }
 
-    ClipboardStore.Text = body.Text;
+    ClipboardStore.Text          = body.Text;
+    ClipboardStore.LastSetByPhone = true;
 
     var sender = context.Connection.RemoteIpAddress?.MapToIPv4().ToString();
     Console.WriteLine($"[CLIPBOARD RECEIVED] From {sender} — \"{Truncate(ClipboardStore.Text, 60)}\"");
 
+    SetWindowsClipboard(ClipboardStore.Text);
+
     await context.Response.WriteAsJsonAsync(new { message = "Clipboard updated." });
 });
 
+// GET /clipboard — phone polls for latest text
 app.MapGet("/clipboard", (HttpContext context) =>
 {
     var requester = context.Connection.RemoteIpAddress?.MapToIPv4().ToString();
@@ -93,119 +99,128 @@ Console.WriteLine("===========================================");
 Console.WriteLine("  Valentine Build — Clipboard Server");
 Console.WriteLine($"  Listening : http://{WifiDirectIP}:{Port}");
 Console.WriteLine($"  Subnet    : {AllowedSubnet}*");
-Console.WriteLine("  Clipboard : auto-syncing to Windows ✓");
+Console.WriteLine("  Phone     : http://192.168.137.74:5001");
+Console.WriteLine("  Clipboard : auto-syncing (bidirectional) ✓");
 Console.WriteLine("===========================================");
 
 app.Run();
 
-// ── Helper ───────────────────────────────────────────────────
+// ── Helpers (top-level) ───────────────────────────────────────
 string Truncate(string value, int maxLength) =>
     value.Length <= maxLength ? value : value[..maxLength] + "…";
+
+static void SetWindowsClipboard(string text)
+{
+    Exception? threadException = null;
+    var staThread = new Thread(() =>
+    {
+        try   { Clipboard.SetText(text); }
+        catch (Exception ex) { threadException = ex; }
+    });
+    staThread.SetApartmentState(ApartmentState.STA);
+    staThread.Start();
+    staThread.Join();
+    if (threadException is not null) throw threadException;
+}
 
 // ── Shared clipboard store ────────────────────────────────────
 static class ClipboardStore
 {
-    public static string Text { get; set; } = string.Empty;
+    public static string Text             { get; set; } = string.Empty;
+    public static bool   LastSetByPhone   { get; set; } = false;
 }
 
 // ── Background sync service ───────────────────────────────────
-// Watches ClipboardStore.Text every second. When it changes,
-// writes the new value into the real Windows clipboard so that
-// Ctrl+V works anywhere on the laptop.
 class ClipboardSyncService : BackgroundService
 {
-    private string _lastSynced = string.Empty;
+    private const string PhoneIP   = "192.168.137.74";  // phone's actual Wi-Fi Direct IP
+    private const int    PhonePort = 5001;
 
-  protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-{
-    Console.WriteLine("[SYNC] Clipboard sync service started.");
+    private readonly HttpClient _http = new();
 
-    string lastClipboardText = string.Empty;
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        Console.WriteLine("[SYNC] Clipboard sync service started (bidirectional).");
 
-    while (!stoppingToken.IsCancellationRequested)
+        string lastWindowsClipboard = string.Empty;
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                string currentWindows = GetWindowsClipboardText();
+
+                bool windowsClipboardChanged = !string.IsNullOrEmpty(currentWindows)
+                                               && currentWindows != lastWindowsClipboard;
+
+                if (windowsClipboardChanged)
+                {
+                    // Always advance the tracker so the next change is evaluated fresh.
+                    lastWindowsClipboard = currentWindows;
+
+                    if (ClipboardStore.LastSetByPhone)
+                    {
+                        // Phone just sent this text — laptop wrote it to Windows clipboard.
+                        // Don't push it back. Clear flag and move on.
+                        ClipboardStore.LastSetByPhone = false;
+                        Console.WriteLine("[ECHO SUPPRESSED] Skipping phone-originated text.");
+                    }
+                    else
+                    {
+                        // Genuine laptop copy — push to phone.
+                        Console.WriteLine($"[LAPTOP COPY DETECTED] \"{Truncate(currentWindows, 60)}\"");
+                        ClipboardStore.Text          = currentWindows;
+                        ClipboardStore.LastSetByPhone = false;
+                        await PushToPhoneAsync(currentWindows, stoppingToken);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SYNC ERROR] {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+        }
+    }
+
+    private async Task PushToPhoneAsync(string text, CancellationToken ct)
     {
         try
         {
-            string currentClipboard = GetWindowsClipboardText();
-
-            if (!string.IsNullOrEmpty(currentClipboard) &&
-                currentClipboard != lastClipboardText)
-            {
-                lastClipboardText = currentClipboard;
-
-                Console.WriteLine(
-                    $"[LAPTOP COPY DETECTED] \"{Truncate(currentClipboard, 60)}\""
-                );
-            }
+            var json     = JsonSerializer.Serialize(new { text });
+            var content  = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync($"http://{PhoneIP}:{PhonePort}/clipboard", content, ct);
+            Console.WriteLine($"[PUSHED TO PHONE] Status: {(int)response.StatusCode}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[READ ERROR] {ex.Message}");
+            Console.WriteLine($"[PUSH ERROR] Could not reach phone: {ex.Message}");
         }
-
-        await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
     }
-}
 
-    // WHY A SEPARATE STA THREAD?
-    //   Windows clipboard APIs require the calling thread to be in
-    //   "Single-Threaded Apartment" (STA) mode. ASP.NET's background
-    //   threads are MTA (multi-threaded apartment) by default, so
-    //   calling Clipboard.SetText() directly would throw an exception.
-    //   The fix: spin up a fresh thread, mark it as STA, do the work,
-    //   then let it finish. This is the standard Windows pattern.
-    private static void SetWindowsClipboard(string text)
+    private static string GetWindowsClipboardText()
     {
+        string result = string.Empty;
         Exception? threadException = null;
 
         var staThread = new Thread(() =>
         {
             try
             {
-                Clipboard.SetText(text);   // System.Windows.Forms.Clipboard
+                if (Clipboard.ContainsText())
+                    result = Clipboard.GetText();
             }
-            catch (Exception ex)
-            {
-                threadException = ex;      // bubble the error back out
-            }
+            catch (Exception ex) { threadException = ex; }
         });
 
-        staThread.SetApartmentState(ApartmentState.STA); // required for clipboard
+        staThread.SetApartmentState(ApartmentState.STA);
         staThread.Start();
-        staThread.Join(); // wait for it to finish before continuing
+        staThread.Join();
 
-        if (threadException is not null)
-            throw threadException;
+        if (threadException is not null) throw threadException;
+        return result;
     }
-
-
-    private static string GetWindowsClipboardText()
-{
-    string result = string.Empty;
-    Exception? threadException = null;
-
-    var staThread = new Thread(() =>
-    {
-        try
-        {
-            if (Clipboard.ContainsText())
-                result = Clipboard.GetText();
-        }
-        catch (Exception ex)
-        {
-            threadException = ex;
-        }
-    });
-
-    staThread.SetApartmentState(ApartmentState.STA);
-    staThread.Start();
-    staThread.Join();
-
-    if (threadException is not null)
-        throw threadException;
-
-    return result;
-}
 
     private static string Truncate(string value, int maxLength) =>
         value.Length <= maxLength ? value : value[..maxLength] + "…";
@@ -213,3 +228,7 @@ class ClipboardSyncService : BackgroundService
 
 // ── Types ────────────────────────────────────────────────────
 record ClipboardPayload(string Text);
+
+
+
+
